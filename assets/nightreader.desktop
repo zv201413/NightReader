@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=NightReader
+Name[zh_CN]=夜读 NightReader
+GenericName=PDF Reader
+GenericName[zh_CN]=PDF 阅读器
+Comment=Offline PDF reading, night modes, bookmarks and highlights
+Comment[zh_CN]=离线 PDF 夜读、书签编辑、搜索与高亮批注
+Exec=nightreader %F
+Icon=nightreader
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=PDF;night;read;夜读;书签;
+StartupNotify=true
+Actions=Settings;
+
+[Desktop Action Settings]
+Name=Settings
+Name[zh_CN]=设置
+Exec=nightreader --settings

@@ -1,0 +1,79 @@
+name: Linux build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-venv python3-gi python3-gi-cairo python3-cairo gir1.2-gtk-3.0 xvfb xauth xdotool dbus-x11 desktop-file-utils fonts-noto-cjk
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install .
+      - name: Check release version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          version = tomllib.load(open('pyproject.toml', 'rb'))['project']['version']
+          if os.environ['REF_TYPE'] == 'tag':
+              assert os.environ['REF_NAME'] == 'v' + version
+          PY
+          .venv/bin/nightreader --version
+          desktop-file-validate assets/nightreader.desktop
+      - name: Run generated-PDF regression tests
+        run: xvfb-run -a dbus-run-session --config-file=packaging/session-bus.conf -- .venv/bin/python packaging/run-tests.py
+      - name: Build binary and dependency sources
+        run: python3 packaging/build-deb.py
+      - name: Verify install, GUI and uninstall in a clean Ubuntu container
+        run: |
+          docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 bash -euxc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y /src/dist/*.deb xvfb xauth xdotool dbus-x11
+            cd /tmp
+            nightreader --version
+            xvfb-run -a dbus-run-session --config-file=/src/packaging/session-bus.conf -- python3 -s /src/packaging/smoke-installed.py
+            apt-get purge -y nightreader
+            test ! -e /usr/bin/nightreader
+            test ! -e /opt/nightreader
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightreader-linux
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nightreader-linux
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "NightReader $RELEASE_TAG · Linux" --notes-file RELEASE_NOTES.md

@@ -1,0 +1,54 @@
+{
+  "target": "Ubuntu 24.04 amd64 / CPython 3.12",
+  "packages": [
+    {
+      "name": "PyMuPDF",
+      "version": "1.27.2",
+      "wheel": {
+        "filename": "pymupdf-1.27.2-cp310-abi3-manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/ab/56/c6c16fa2dcfe2476ec28a9aaaca773dc35c593699e81e573211c91442770/pymupdf-1.27.2-cp310-abi3-manylinux_2_28_x86_64.whl",
+        "sha256": "917f4dd52daea504d5c60e1430c17d637b5014a43e66d068b4b356effe087dba"
+      },
+      "source": {
+        "filename": "pymupdf-1.27.2.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/a4/fb/d80374ab091ab7ad5a5e7981a45c877ae094db668c1ab4d30f1109a4ec6a/pymupdf-1.27.2.tar.gz",
+        "sha256": "37fc9cedeafb40839f86a074d4d9feab725144bdd4bbfd20308ff8957e2b10af"
+      }
+    },
+    {
+      "name": "numpy",
+      "version": "2.5.2",
+      "wheel": {
+        "filename": "numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/3a/5f/62d28cf019460c7f1394105b4d49d9911a9c444cb77ab0bd95a204c5a6de/numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "3cdec01fa790a186d430433fdd4d4ffb70eed6f0eeb4bf05c8dbe2dce0a9bcb8"
+      },
+      "source": {
+        "filename": "numpy-2.5.2.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/9a/80/db0b4559e57ec36362bedbb05530a87fafbcb6067708c946967a41d449e7/numpy-2.5.2.tar.gz",
+        "sha256": "d482d171c406ae88c5b19cad3b6a1c4c5209f886ab74bc44c2c865c23f52d860"
+      }
+    },
+    {
+      "name": "pillow",
+      "version": "12.3.0",
+      "wheel": {
+        "filename": "pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91"
+      },
+      "source": {
+        "filename": "pillow-12.3.0.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
+        "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce"
+      }
+    }
+  ],
+  "native_sources": [
+    {
+      "filename": "mupdf-1.27.2-source.tar.gz",
+      "url": "https://mupdf.com/downloads/archive/mupdf-1.27.2-source.tar.gz",
+      "sha256": "553867b135303dc4c25ab67c5f234d8e900a0e36e66e8484d99adc05fe1e8737"
+    }
+  ]
+}
