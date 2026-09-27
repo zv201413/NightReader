@@ -11,11 +11,11 @@ primarily Chinese.
 **首版安装包支持 Ubuntu 24.04 LTS、x86_64 / amd64。** 不提供 Windows、macOS 或 ARM 安装包；其他 Linux 发行版暂未验证，可以尝试下面的源码安装方式。
 
 1. 打开 [Releases 下载页](https://github.com/zv201413/NightReader/releases/latest)。
-2. 下载 `NightReader_0.1.0_ubuntu24.04_amd64.deb`。
+2. 下载 `NightReader_0.2.0_ubuntu24.04_amd64.deb`。
 3. 在下载目录打开终端执行：
 
 ```bash
-sudo apt install ./NightReader_0.1.0_ubuntu24.04_amd64.deb
+sudo apt install ./NightReader_0.2.0_ubuntu24.04_amd64.deb
 ```
 
 之后从应用菜单打开 **夜读 NightReader**，或右键 PDF → 打开方式 → NightReader。
@@ -98,7 +98,7 @@ python3 packaging/build-deb.py
 构建脚本按 `packaging/dependencies.json` 下载固定版本的 wheel 和对应源码，校验 SHA-256，然后生成 `.deb`、依赖源码归档和校验文件。应用运行时不调用 pip。
 
 GitHub Actions 对代码执行测试、构建，并在干净 Ubuntu 容器中验证安装、GUI 搜索、保存和卸载。
-推送 `v0.1.0` 这类版本标签后，只有所有检查通过才会发布 GitHub Release。
+推送 `v0.2.0` 这类版本标签后，只有所有检查通过才会发布 GitHub Release。
 
 ## 许可与反馈
 

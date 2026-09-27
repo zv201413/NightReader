@@ -38,12 +38,14 @@ DEFAULTS: dict[str, Any] = {
     "highlight_opacity": 1.0,
     "remember_position": True,
     "selection_mode": "text",
+    "ui_font_scale": 100,
     "shortcuts": {},
 }
 
 PREFERENCE_KEYS = ("night_mode", "highlight_color", "highlight_opacity",
                    "comfort_preset", "comfort_weight", "comfort_contrast", "comfort_brightness",
-                   "sidebar_visible", "remember_position", "selection_mode", "shortcuts")
+                   "sidebar_visible", "remember_position", "selection_mode", "ui_font_scale",
+                   "shortcuts")
 
 
 def validated(cfg: dict) -> dict:
@@ -62,6 +64,11 @@ def validated(cfg: dict) -> dict:
         out["night_mode"] = DEFAULTS["night_mode"]
     if out["selection_mode"] not in ("text", "rectangle"):
         out["selection_mode"] = DEFAULTS["selection_mode"]
+    value = out["ui_font_scale"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        out["ui_font_scale"] = DEFAULTS["ui_font_scale"]
+    else:
+        out["ui_font_scale"] = max(70, min(200, round(value)))
     if out["highlight_color"] not in ("黄", "绿", "蓝", "粉", "橙", "紫"):
         out["highlight_color"] = DEFAULTS["highlight_color"]
     try:

@@ -63,6 +63,8 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
 
         self.cfg = config.load()
         self.text_presentation = self.cfg["text_presentation"]
+        from .settings import apply_ui_font_scale
+        apply_ui_font_scale(self.cfg["ui_font_scale"])
         self._restore_id = 0
         self._selection_request = None
         self._selection_inflight = False
@@ -239,8 +241,6 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
             return b
 
         btn("打开", self._on_open_clicked, action="open")
-        btn("上一页", lambda *_: self.view.prev_page(), action="prev_page")
-        btn("下一页", lambda *_: self.view.next_page(), action="next_page")
 
         tb.pack_start(Gtk.Label(label="页码"), False, False, 6)
         self.page_entry = Gtk.Entry()
@@ -258,10 +258,7 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         self.zoom_label = Gtk.Label(label="1.00×")
         tb.pack_end(self.zoom_label, False, False, 6)
 
-        # Keep display and annotation controls visible at ordinary window widths.
-        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        rows.pack_start(tb, False, False, 0)
-
+        # 显示与批注控件与上面的翻页/缩放控件同处一行(工具栏可横向滚动)。
         # M3:夜读模式按钮(三态循环,与热键 D 同步)
         self.night_btn = btn("夜读:反相", lambda *_: self.cycle_night_mode(), action="night_mode")
 
@@ -1279,8 +1276,10 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
     def _apply_preferences(self, cfg: dict) -> None:
         from .annotate import COLORS
         from .comfort import parameters
+        from .settings import apply_ui_font_scale
         for key in config.PREFERENCE_KEYS:
             self.cfg[key] = cfg[key]
+        apply_ui_font_scale(cfg["ui_font_scale"])
         self._bindings = shortcuts.effective(cfg["shortcuts"])
         self._shortcut_map = shortcuts.keymap(self._bindings)
         for action, button in self._shortcut_buttons.items():

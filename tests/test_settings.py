@@ -22,6 +22,42 @@ class TestSettingsConfig(unittest.TestCase):
             self.assertEqual(cfg[key], config.DEFAULTS[key])
         self.assertNotIn("unknown", cfg)
 
+    def test_ui_font_scale_is_clamped(self):
+        self.assertEqual(config.validated({"ui_font_scale": 500})["ui_font_scale"], 200)
+        self.assertEqual(config.validated({"ui_font_scale": 10})["ui_font_scale"], 70)
+        self.assertEqual(config.validated({"ui_font_scale": "x"})["ui_font_scale"], 100)
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "requires X11")
+class TestUiFontScale(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="nr_uifont_")
+        self.addCleanup(self.tmp.cleanup)
+        for key, value in (("CONFIG_DIR", self.tmp.name),
+                           ("CONFIG_PATH", self.tmp.name + "/config.json")):
+            mock = patch.object(config, key, value)
+            mock.start()
+            self.addCleanup(mock.stop)
+        config.save(config.DEFAULTS)
+
+    def test_saving_panel_persists_scale_and_applies_css(self):
+        from nightread.settings import SettingsWindow, apply_ui_font_scale
+        from nightread import settings as settings_mod
+        panel = SettingsWindow()
+        self.addCleanup(panel.destroy)
+        panel.ui_font.set_value(150)
+        panel._save()
+        self.assertEqual(config.load()["ui_font_scale"], 150)
+        # The provider is a module singleton; a larger scale must render a
+        # larger point size in its CSS than a smaller one.
+        apply_ui_font_scale(80)
+        small = settings_mod._ui_font_provider.to_string()
+        apply_ui_font_scale(200)
+        large = settings_mod._ui_font_provider.to_string()
+        def pt(css):
+            return float(css.split("font-size:")[1].split("pt")[0])
+        self.assertGreater(pt(large), pt(small))
+
 
 @unittest.skipUnless(os.environ.get("DISPLAY") and shutil.which("xdotool"), "requires X11")
 class TestSettingsPanel(unittest.TestCase):

@@ -3,10 +3,36 @@ from __future__ import annotations
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk
+from gi.repository import Gtk, Gdk, Pango
 
 from . import config, darkmode, shortcuts, comfort
 from .annotate import COLORS
+
+
+_ui_font_provider = None
+
+
+def apply_ui_font_scale(percent, screen=None) -> None:
+    """按百分比缩放全部 nightread 窗口的界面字号(不动 PDF 正文)。
+
+    只改字号、保留系统主题的字体家族:从 gtk-font-name 取基准字号,乘以
+    百分比后用一个屏幕级 CssProvider 覆盖。正文是定版 PDF,字号随缩放变,
+    无法像界面这样单独调,故设置面板只提供界面字号一项。
+    """
+    global _ui_font_provider
+    screen = screen or Gdk.Screen.get_default()
+    if screen is None:
+        return
+    settings = Gtk.Settings.get_default()
+    font_name = settings.get_property("gtk-font-name") if settings else "Sans 10"
+    desc = Pango.FontDescription(font_name)
+    base = desc.get_size() / Pango.SCALE if desc.get_size() > 0 else 10.0
+    size_pt = max(6.0, base * percent / 100.0)
+    if _ui_font_provider is None:
+        _ui_font_provider = Gtk.CssProvider()
+    _ui_font_provider.load_from_data(f"* {{ font-size: {size_pt:.1f}pt; }}".encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, _ui_font_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
 
 class SettingsWindow(Gtk.Window):
@@ -47,10 +73,14 @@ class SettingsWindow(Gtk.Window):
         self.selection_mode.append("text", "连续选字")
         self.selection_mode.append("rectangle", "区域 / 列选择")
         self.selection_mode.set_active_id(cfg["selection_mode"])
+        self.ui_font = Gtk.SpinButton.new_with_range(70, 200, 5)
+        self.ui_font.set_value(cfg["ui_font_scale"])
+        self.ui_font.set_tooltip_text("界面按钮、菜单和侧栏的字号(不影响 PDF 正文)。")
         for row, (title, widget) in enumerate((("阅读模式", self.mode),
                                               ("高亮颜色", self.color),
                                               ("高亮浓度（%）", self.opacity),
-                                              ("选字方式", self.selection_mode))):
+                                              ("选字方式", self.selection_mode),
+                                              ("界面字体大小（%）", self.ui_font))):
             label = Gtk.Label(label=title, xalign=0)
             grid.attach(label, 0, row, 1, 1)
             widget.set_hexpand(True)
@@ -59,8 +89,8 @@ class SettingsWindow(Gtk.Window):
         self.sidebar.set_active(cfg["sidebar_visible"])
         self.remember = Gtk.CheckButton(label="记住上次阅读页码")
         self.remember.set_active(cfg["remember_position"])
-        grid.attach(self.sidebar, 0, 4, 2, 1)
-        grid.attach(self.remember, 0, 5, 2, 1)
+        grid.attach(self.sidebar, 0, 5, 2, 1)
+        grid.attach(self.remember, 0, 6, 2, 1)
         note = Gtk.Label(label="高亮在日间、反相和柔化模式下保持原色。\n颜色和浓度设置用于新添加的高亮。", xalign=0)
         note.set_line_wrap(True)
         reading.pack_start(note, False, False, 0)
@@ -88,11 +118,13 @@ class SettingsWindow(Gtk.Window):
                   "sidebar_visible": self.sidebar.get_active(),
                   "remember_position": self.remember.get_active(),
                   "selection_mode": self.selection_mode.get_active_id(),
+                  "ui_font_scale": int(self.ui_font.get_value()),
                   **self._comfort_values(),
                   "shortcuts": self._bindings}
         if not config.update(values):
             self.status.set_text("保存失败，请检查配置目录是否可写。")
             return
+        apply_ui_font_scale(int(self.ui_font.get_value()))
         if self._on_apply:
             self._on_apply(config.load())
         self._active_shortcuts = shortcuts.keymap(self._bindings)
@@ -291,6 +323,7 @@ class SettingsApp(Gtk.Application):
 
     def do_activate(self):
         if self.window is None:
+            apply_ui_font_scale(config.load()["ui_font_scale"])
             self.window = SettingsWindow(app=self)
             self.window.connect("destroy", self._forget_window)
         self.window.show_all()

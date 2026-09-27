@@ -82,10 +82,16 @@ class TestWindowGeometry(unittest.TestCase):
         reopened=self.reader()
         self.assertEqual(tuple(reopened.get_size()), (940,620))
         self.assertLessEqual(reopened.toolbar_scroll.get_allocated_width(),940)
+        # Toolbar is a single row now: display/annotation controls share the
+        # save button's row instead of wrapping to a second one.
+        _x, save_y = reopened.save_btn.translate_coordinates(reopened, 0, 0)
         for button in (reopened.selection_btn, reopened._shortcut_buttons['settings']):
-            x, _y = button.translate_coordinates(reopened, 0, 0)
-            self.assertGreaterEqual(x, 0)
-            self.assertLessEqual(x + button.get_allocated_width(), 940)
+            _x, y = button.translate_coordinates(reopened, 0, 0)
+            self.assertLessEqual(abs(y - save_y), 2)
+        # The merged row overflows 940px, so the horizontal scroller keeps the
+        # right-hand controls reachable rather than forcing the window wider.
+        self.assertGreater(reopened.toolbar_scroll.get_hadjustment().get_upper(),
+                           reopened.toolbar_scroll.get_allocated_width())
 
     def test_new_window_uses_latest_resize_before_first_window_closes(self):
         first=self.reader()
