@@ -69,7 +69,9 @@ class TestComfortPanel(unittest.TestCase):
         self.wait(lambda:reader._path and 0 in reader.view._rendered and not reader.view._pending)
         reader.cycle_view_mode()
         self.wait(lambda:0 in reader.view._rendered and not reader.view._pending)
-        get_pixels=lambda:reader.view._rendered[0].get_pixels()
+        def get_pixels():
+            self.wait(lambda:0 in reader.view._rendered)
+            return bytes(reader.view._rendered[0].get_data())
         standard=get_pixels()
         base=reader.view._pixmaps[0].samples
         panel=SettingsWindow();self.addCleanup(panel.destroy);panel.show_all()

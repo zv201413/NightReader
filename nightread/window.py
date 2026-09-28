@@ -40,9 +40,10 @@ from . import config
 from . import shortcuts
 from . import darkmode
 from .bookmarks import BookmarkModel
-from .docworker import (DocWorker, Task, OPEN, CLOSE, RENDER, RENDER_TEXT, GET_TOC,
+from .docworker import (Task, OPEN, CLOSE, RENDER, RENDER_TEXT, GET_TOC,
                         SET_TOC_ITEM, SET_TOC, SAVE, SEARCH, BUILD_INDEX,
                         ADD_ANNOT, DEL_ANNOT, GET_ANNOTS, SELECT_TEXT)
+from .processworker import ProcessDocWorker
 from .continuous import ContinuousView, ZOOM_MIN, ZOOM_MAX
 
 
@@ -51,7 +52,7 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
 
     数据流:
         UI 事件 → worker.submit(Task(...), callback=on_xxx)
-                → worker 线程执行(唯一碰文档的地方)
+                → 独立文档子进程串行执行(唯一碰文档的地方)
                 → GLib.idle_add 回 UI 线程 → callback → 更新控件
     """
 
@@ -83,12 +84,16 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         self._sidebar_position = min(self.cfg["sidebar_width"], self._normal_size[0] // 2)
         self.set_default_size(*self._normal_size)
 
-        self.worker = DocWorker(on_generation_change=self._on_generation_change)
+        self.worker = ProcessDocWorker(on_generation_change=self._on_generation_change)
         self.worker.start()
 
         self.page_count = 0
         self.page_size_w, self.page_size_h = 595.0, 842.0
         self._pending_render_id = 0
+        self._render_queue = {}
+        self._render_active = False
+        self._render_dispatch_id = 0
+        self._render_closed = False
         # render 计时用:记录最近一次渲染耗时(M1-2)
         self.last_render_ms = 0.0
         # M2:当前文件路径与脏标记
@@ -112,6 +117,8 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         self.last_save_mode = ""
 
         self._build_ui()
+        from .memstats import MemoryReporter
+        self._memory_reporter = MemoryReporter.start_if_enabled(self.worker, self.cont_view)
         self._apply_preferences(self.cfg)
         self._watch_preferences()
         self.connect("destroy", self._on_destroy)
@@ -647,28 +654,67 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         return False            # 取消
 
     def _request_render(self, page_no: int, zoom: float) -> None:
-        """请求渲染。先查缓存(K8),未命中才投递 worker。
+        """Keep at most one render on the worker; reprioritize the rest on GTK.
 
-        连续模式下会同时请求多页,所以**页号必须一路带到回调里** ——
-        不能像单页模式那样用"当前页"代替,否则渲染结果会落错页。
-
-        视图模式(图片层/文字层)一并带进 meta:切换模式后仍在途的旧模式
-        结果必须被丢弃,否则屏幕上会新旧混着显示。
+        Fast scrolling/zooming replaces obsolete requests before they consume
+        MuPDF time. Document operations retain their worker queue ordering.
         """
-        mode = self.cont_view.view_mode
-        if mode == "text":
-            self.worker.submit(Task(RENDER_TEXT, {"page_no": page_no, "zoom": zoom,
-                                                  "presentation": self.text_presentation},
-                                    callback=self._on_rendered,
-                                    meta={"page_no": page_no, "zoom": zoom,
-                                          "view_mode": mode,
-                                          "text_presentation": self.text_presentation}))
+        if self._render_closed:
             return
-        self.worker.submit(Task(RENDER, {"page_no": page_no, "zoom": zoom,
-                                        "highlight_masks": True},
-                                callback=self._on_rendered,
-                                meta={"page_no": page_no, "zoom": zoom,
-                                      "view_mode": mode}))
+        want = self.cont_view._visible_window()
+        for pno in list(self._render_queue):
+            if pno not in want:
+                self._render_queue.pop(pno)
+                self.cont_view._pending.discard(pno)
+        mode = self.cont_view.view_mode
+        self._render_queue[page_no] = {"page_no": page_no, "zoom": zoom,
+                                      "view_mode": mode, "generation": self.worker.generation,
+                                      "text_presentation": self.text_presentation}
+        if not self._render_active and not self._render_dispatch_id:
+            self._render_dispatch_id = GLib.idle_add(self._dispatch_render)
+
+    def _dispatch_render(self):
+        self._render_dispatch_id = 0
+        if self._render_closed or self._render_active:
+            return False
+        cv = self.cont_view
+        want = cv._visible_window()
+        for pno, meta in list(self._render_queue.items()):
+            if (pno not in want or meta["generation"] != self.worker.generation
+                    or meta["view_mode"] != cv.view_mode
+                    or abs(meta["zoom"] - cv.page_zoom(pno)) > 1e-9
+                    or (cv.view_mode == "text" and
+                        meta["text_presentation"] != self.text_presentation)):
+                self._render_queue.pop(pno)
+                cv._pending.discard(pno)
+        if not self._render_queue:
+            return False
+        visible = cv._visible_pages()
+        pno = min(self._render_queue, key=lambda p: (
+            p not in visible, abs(p - cv.page_no),
+            (p - cv.page_no) * cv._scroll_direction < 0))
+        meta = self._render_queue.pop(pno)
+        kwargs = {"page_no": pno, "zoom": meta["zoom"]}
+        kind = RENDER_TEXT if meta["view_mode"] == "text" else RENDER
+        if kind == RENDER_TEXT:
+            kwargs["presentation"] = meta["text_presentation"]
+        else:
+            kwargs["highlight_masks"] = True
+        self._render_active = True
+
+        def done(result):
+            self._render_active = False
+            if self._render_closed:
+                return
+            try:
+                if not result.ok:
+                    cv._pending.discard(pno)
+                self._on_rendered(result)
+            finally:
+                self._dispatch_render()
+
+        self.worker.submit(Task(kind, kwargs, callback=done, meta=meta))
+        return False
 
     def _deliver_pixmap(self, page_no, zoom, pix, from_cache=False, highlight_masks=(),
                         view_mode=None) -> None:
@@ -756,7 +802,7 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         self._set_status(
             f"第 {cv.page_no + 1}/{self.page_count} 页 · "
             f"{zoom:.2f}× · 渲染 {self.last_render_ms:.0f} ms · "
-            f"常驻 {len(cv._rendered)} 页 / {mb:.1f} MB{dirty}{display_note}")
+            f"常驻 {len(cv._pixmaps)} 页 / {mb:.1f} MB{dirty}{display_note}")
 
     def _on_generation_change(self, gen: int) -> None:
         """文档代数变了 —— 旧对象全部作废。"""
@@ -1370,6 +1416,13 @@ class MainWindow(Gtk.ApplicationWindow if _HAVE_GTK else object):
         self.statusbar.push(self._status_ctx, text)
 
     def _on_destroy(self, _w) -> None:
+        self._render_closed = True
+        self._render_queue.clear()
+        if self._render_dispatch_id:
+            GLib.source_remove(self._render_dispatch_id)
+            self._render_dispatch_id = 0
+        if self._memory_reporter is not None:
+            self._memory_reporter.close()
         self.clear_search()
         if self._geometry_save_id:
             GLib.source_remove(self._geometry_save_id)

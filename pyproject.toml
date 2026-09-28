@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightreader"
-version = "0.2.0"
+version = "0.3.0"
 description = "An offline Linux PDF reader with night modes, editable bookmarks and text search"
 readme = "README.md"
 requires-python = ">=3.12"

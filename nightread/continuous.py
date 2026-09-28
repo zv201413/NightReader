@@ -6,7 +6,9 @@ Gtk.Scrollable 阻止 ScrolledWindow 自动包上会被全书高度撑大的 Vie
 from __future__ import annotations
 
 import math
+import os
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 import fitz
@@ -21,11 +23,81 @@ except Exception:
     _HAVE_GTK = False
 
 from . import darkmode
-from .viewer import ZOOM_MIN, ZOOM_MAX, to_gdkpixbuf
+from .viewer import ZOOM_MIN, ZOOM_MAX, to_cairo_surface
 
 WINDOW_MARGIN = 3
 SETTLE_MS = 120
+TRIM_IDLE_MS = 1500   # quiet time before malloc_trim hands freed pages back (memory plan P1)
 PAGE_GAP = 6
+SURFACE_PREFETCH_BYTES = 16 * 1024 * 1024
+
+
+# --- glibc allocator tuning --------------------------------------------------
+# Page buffers get freed, but glibc keeps the pages: its dynamic mmap threshold
+# moves big buffers into the arenas, and free() only trims the heap top, so RSS
+# stays near its peak. Fix the thresholds at startup and return free pages once
+# the view is idle. NIGHTREAD_ALLOC_TUNING=0 turns both off (A/B measurement).
+# Every step is optional: without glibc (musl, macOS) or ctypes it is a no-op.
+ALLOC_TUNING_ENV = "NIGHTREAD_ALLOC_TUNING"
+_M_MMAP_THRESHOLD = -3            # values from glibc <malloc.h>
+_M_ARENA_MAX = -8
+_MMAP_THRESHOLD_BYTES = 256 * 1024
+_ARENA_MAX = 2
+_libc = None
+_libc_probed = False
+
+
+def alloc_tuning_enabled() -> bool:
+    value = os.environ.get(ALLOC_TUNING_ENV, "").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _glibc():
+    """Return a ctypes handle to glibc, or None on any other libc or failure."""
+    global _libc, _libc_probed
+    if not _libc_probed:
+        _libc_probed = True
+        try:
+            if (os.confstr("CS_GNU_LIBC_VERSION") or "").startswith("glibc"):
+                import ctypes   # lazy: a Python built without ctypes must still start
+                lib = ctypes.CDLL("libc.so.6")
+                lib.mallopt.argtypes = (ctypes.c_int, ctypes.c_int)
+                lib.mallopt.restype = ctypes.c_int
+                lib.malloc_trim.argtypes = (ctypes.c_size_t,)
+                lib.malloc_trim.restype = ctypes.c_int
+                _libc = lib
+        except Exception:
+            _libc = None
+    return _libc
+
+
+def tune_allocator() -> bool:
+    """Once at startup: fixed 256 KiB mmap threshold, at most two arenas.
+
+    Returns True only if glibc accepted both settings. Never raises.
+    """
+    if not alloc_tuning_enabled():
+        return False
+    try:
+        lib = _glibc()
+        if lib is None:
+            return False
+        threshold_ok = lib.mallopt(_M_MMAP_THRESHOLD, _MMAP_THRESHOLD_BYTES) == 1
+        arenas_ok = lib.mallopt(_M_ARENA_MAX, _ARENA_MAX) == 1
+        return threshold_ok and arenas_ok
+    except Exception:
+        return False
+
+
+def release_free_memory() -> bool:
+    """malloc_trim(0). True if glibc released memory. Never raises."""
+    if not alloc_tuning_enabled():
+        return False
+    try:
+        lib = _glibc()
+        return lib is not None and lib.malloc_trim(0) == 1
+    except Exception:
+        return False
 
 
 if _HAVE_GTK:
@@ -65,12 +137,19 @@ class ContinuousView:
         self._auto_fit = True
         self._pixmaps = {}
         self._highlight_masks = {}
-        self._rendered = {}  # page_no -> GdkPixbuf, never a full-document widget
+        self._rendered = {}  # visible pages plus at most one bounded look-ahead surface
+        self._surface_executor = None
+        self._surface_future = None
+        self._surface_epoch = 0
+        self._surface_error = None
+        self._surface_failed = set()
         self._pending = set()
         self._heights = []
         self._tops = [0.0]
         self._suppress_scroll = False
+        self._scroll_direction = 1
         self._settle_id = 0
+        self._trim_id = 0
         self._destroyed = False
         self._overlay_rects = []
         self._selection_rects = []
@@ -140,6 +219,7 @@ class ContinuousView:
                     highlight_masks=()) -> None:
         if self._destroyed:
             return
+        self._schedule_trim()   # a finished render also counts as activity
         pno = self.page_no if page_no is None else int(page_no)
         self._pending.discard(pno)
         if pno not in self._visible_window():
@@ -215,8 +295,7 @@ class ContinuousView:
 
     def set_night_mode(self, mode: str) -> None:
         self.night_mode = mode
-        for pno in list(self._pixmaps):
-            self._materialize(pno)
+        self._invalidate_surfaces()
 
     def set_view_mode(self, mode: str, force: bool = False) -> str:
         """切换 图片层 / 文字层。
@@ -324,37 +403,124 @@ class ContinuousView:
         if self._destroyed:
             return
         want = self._visible_window()
-        for pno in list(self._rendered):
+        self._pending.intersection_update(want)
+        for pno in list(self._pixmaps):
             if pno not in want:
                 self._release(pno)
+        self._sync_surfaces()
         for pno in sorted(want, key=lambda n: abs(n - self.page_no)):
-            if pno not in self._rendered and pno not in self._pending:
+            if pno not in self._pixmaps and pno not in self._pending:
                 self._pending.add(pno)
                 self._request_render(pno, self.page_zoom(pno))
+        self._schedule_trim()
 
     def _materialize(self, pno: int) -> None:
-        base = self._pixmaps.get(pno)
-        if base is not None:
-            self._rendered[pno] = to_gdkpixbuf(darkmode.render_page(
-                base, self.night_mode, self._highlight_masks.get(pno, ()),
-                comfort_params=(self.comfort_params if self.view_mode == "text" and
-                                self.text_presentation == "reading" else None)))
-            self.canvas.queue_draw()
+        self._rendered.pop(pno, None)
+        self._surface_failed.discard(pno)
+        self._sync_surfaces()
+
+    def _visible_pages(self) -> set:
+        if not self.page_count:
+            return set()
+        vy = self.scroller.get_vadjustment().get_value()
+        return set(range(self._page_at_y(vy), self._page_at_y(
+            vy + self.canvas.get_allocated_height()) + 1))
+
+    def _surface_pages(self) -> set:
+        visible = self._visible_pages()
+        if not visible:
+            return visible
+        ahead = max(visible) + 1 if self._scroll_direction >= 0 else min(visible) - 1
+        base = self._pixmaps.get(ahead)
+        if (base is not None and
+                base.width * base.height * 4 <= SURFACE_PREFETCH_BYTES):
+            visible.add(ahead)
+        return visible
+
+    def _invalidate_surfaces(self):
+        self._surface_epoch += 1
+        self._rendered.clear()
+        self._surface_failed.clear()
+        self._sync_surfaces()
+        self.canvas.queue_draw()
+
+    def _sync_surfaces(self) -> None:
+        if self._destroyed:
+            return
+        wanted = self._surface_pages()
+        for pno in list(self._rendered):
+            if pno not in wanted:
+                self._rendered.pop(pno)
+        if self._surface_future is not None:
+            return
+        missing = (wanted & self._pixmaps.keys()) - self._rendered.keys() - self._surface_failed
+        if not missing:
+            return
+        visible = self._visible_pages()
+        pno = min(missing, key=lambda p: (p not in visible, abs(p - self.page_no)))
+        base, epoch = self._pixmaps[pno], self._surface_epoch
+        mode, masks = self.night_mode, self._highlight_masks.get(pno, ())
+        comfort = (self.comfort_params if self.view_mode == "text" and
+                   self.text_presentation == "reading" else None)
+        if self._surface_executor is None:
+            self._surface_executor = ThreadPoolExecutor(max_workers=1,
+                                                        thread_name_prefix="nightread-surface")
+
+        def convert():
+            # Private pixel buffers and cairo surface; no GTK/Document access.
+            return to_cairo_surface(darkmode.render_page(base, mode, masks, comfort))
+
+        future = self._surface_executor.submit(convert)
+        self._surface_future = future
+
+        def delivered(surface, error):
+            self._surface_future = None
+            if self._destroyed:
+                return False
+            current = (epoch == self._surface_epoch and self._pixmaps.get(pno) is base
+                       and pno in self._surface_pages())
+            if error is not None:
+                if current:
+                    self._surface_failed.add(pno)
+                    self._surface_error = str(error)
+                    if self._on_status:
+                        self._on_status(f"页面显示转换失败: {error}")
+            else:
+                if current:
+                    self._rendered[pno] = surface
+                    self._surface_error = None
+                    self.canvas.queue_draw()
+            self._sync_surfaces()
+            self._schedule_trim()
+            return False
+
+        def finished(completed):
+            try:
+                surface, error = completed.result(), None
+            except Exception as exc:
+                surface, error = None, exc
+            GLib.idle_add(delivered, surface, error)
+
+        # Do not capture `future` in its own callback: that reference cycle
+        # would retain full page buffers until Python's cyclic GC happened.
+        future.add_done_callback(finished)
 
     def set_comfort_params(self, params):
         if tuple(params) != self.comfort_params:
             self.comfort_params = tuple(params)
             if self.view_mode == "text" and self.text_presentation == "reading":
-                for pno in list(self._pixmaps):
-                    self._materialize(pno)
+                self._invalidate_surfaces()
 
     def _release(self, pno: int) -> None:
         self._rendered.pop(pno, None)
         self._pixmaps.pop(pno, None)
         self._highlight_masks.pop(pno, None)
         self._pending.discard(pno)
+        self._surface_failed.discard(pno)
 
     def _drop_all_rendered(self) -> None:
+        self._surface_epoch += 1
+        self._surface_failed.clear()
         self._rendered.clear()
         self._pixmaps.clear()
         self._highlight_masks.clear()
@@ -375,6 +541,9 @@ class ContinuousView:
         cr.paint()
         if not self.page_count:
             return False
+        # Scrolling within prefetched pages needs no worker round-trip, even
+        # before the scroll-settle timer fires. Steady frames reuse surfaces.
+        self._sync_surfaces()
         vy = self.scroller.get_vadjustment().get_value()
         hx = self.scroller.get_hadjustment().get_value()
         first = self._page_at_y(vy)
@@ -387,7 +556,7 @@ class ContinuousView:
             cr.save()
             cr.rectangle(left, top, pix.get_width(), pix.get_height())
             cr.clip()
-            Gdk.cairo_set_source_pixbuf(cr, pix, left, top)
+            cr.set_source_surface(pix, left, top)
             cr.paint()
             cr.translate(left, top)
             zoom = self.page_zoom(pno)
@@ -418,6 +587,7 @@ class ContinuousView:
 
     def _set_current_page(self, pno: int) -> None:
         if pno != self.page_no:
+            self._scroll_direction = 1 if pno > self.page_no else -1
             self.page_no = pno
             self.clear_overlay()
             if self._on_page_changed:
@@ -439,6 +609,7 @@ class ContinuousView:
         if self._suppress_scroll:
             return
         self._set_current_page(self._page_at_y(adj.get_value() + adj.get_page_size() / 2))
+        self._ensure_window()
         if self._settle_id:
             GLib.source_remove(self._settle_id)
         self._settle_id = GLib.timeout_add(SETTLE_MS, self._on_settle)
@@ -449,6 +620,21 @@ class ContinuousView:
     def _on_settle(self) -> bool:
         self._settle_id = 0
         self._ensure_window()
+        return False
+
+    def _schedule_trim(self) -> None:
+        # Scroll settle, zoom, page jumps (all via _ensure_window) and finished
+        # renders (show_pixmap) restart one countdown, so malloc_trim runs once,
+        # after the view has been quiet for TRIM_IDLE_MS. Never per frame.
+        if not alloc_tuning_enabled() or _glibc() is None:
+            return
+        if self._trim_id:
+            GLib.source_remove(self._trim_id)
+        self._trim_id = GLib.timeout_add(TRIM_IDLE_MS, self._on_trim_idle)
+
+    def _on_trim_idle(self) -> bool:
+        self._trim_id = 0
+        release_free_memory()   # module-global lookup, so probes can wrap it
         return False
 
     def enable_selection(self, on_selection, on_clear=None) -> None:
@@ -554,15 +740,33 @@ class ContinuousView:
 
     def _on_destroy(self, _widget) -> None:
         self._destroyed = True
+        if self._surface_executor is not None:
+            self._surface_executor.shutdown(wait=False, cancel_futures=True)
         self.clear_overlay()
         if self._settle_id:
             GLib.source_remove(self._settle_id)
             self._settle_id = 0
+        if self._trim_id:
+            GLib.source_remove(self._trim_id)
+            self._trim_id = 0
         self._drop_all_rendered()
 
     def stats(self) -> dict:
-        return {"resident_pages": len(self._rendered), "window": len(self._visible_window()),
+        return {"resident_pages": len(self._pixmaps), "window": len(self._visible_window()),
                 "zoom": round(self.page_zoom(self.page_no), 3), "fit_zoom": round(self._fit_zoom, 3)}
 
     def resident_bytes(self) -> int:
-        return sum(p.height * p.stride for p in self._pixmaps.values())
+        stats = self.memory_stats()
+        return stats["pixmap_bytes"] + stats["rendered_bytes"] + stats["mask_bytes"]
+
+    def memory_stats(self) -> dict:
+        return {"page": self.page_no + 1, "resident_pages": len(self._pixmaps),
+                "surface_pages": len(self._rendered),
+                "surface_work_pending": self._surface_future is not None,
+                "surface_error": self._surface_error,
+                "pending_pages": len(self._pending),
+                "pixmap_bytes": sum(p.height * p.stride for p in self._pixmaps.values()),
+                "rendered_bytes": sum(p.get_stride() * p.get_height()
+                                      for p in self._rendered.values()),
+                "mask_bytes": sum(len(m["alpha"]) for masks in self._highlight_masks.values()
+                                  for m in masks)}

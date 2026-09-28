@@ -22,6 +22,9 @@ Z1 的解法正在于此:样板第 7 页标题实际是 `1  总  则`(字间多�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from array import array
+from collections import OrderedDict
+from collections.abc import Sequence
 
 import fitz
 
@@ -34,15 +37,40 @@ class CharBox:
     page: int              # 页号,从 1 起(PyMuPDF 口径)
 
 
+class PackedBoxes(Sequence):
+    """Four float32 coordinates per character, instead of tuples of floats.
+
+    MuPDF coordinates are already float32; packing preserves every source bit.
+    Materialize tuples only for the small range being selected/highlighted.
+    """
+    def __init__(self):
+        self.data = array('f')
+
+    def append(self, box):
+        self.data.extend(box)
+
+    def __len__(self):
+        return len(self.data) // 4
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return tuple(self.data[index * 4:index * 4 + 4])
+
+
 @dataclass
 class PageIndex:
     """单页的字符索引。"""
     page: int
     norm_text: str = ""
-    boxes: list = field(default_factory=list)      # 与 norm_text 逐位对应
+    boxes: Sequence = field(default_factory=PackedBoxes)  # aligned with norm_text
     lines: list = field(default_factory=list)      # (start, end, bbox),字符命中用
     source_text: str = ""                         # 复制用,保留空白与行分隔
-    source_offsets: list = field(default_factory=list)  # norm_idx → source_text 下标
+    source_offsets: array = field(default_factory=lambda: array('I'))
 
     def __len__(self) -> int:
         return len(self.norm_text)
@@ -62,9 +90,10 @@ def build_page_index(page: fitz.Pixmap_or_Page, page_no: int) -> PageIndex:
     遍历 rawdict 的 blocks → lines → spans → chars,剔除所有空白字符。
     """
     idx = PageIndex(page=page_no)
-    raw = page.get_text("rawdict")
+    # Image bytes are unrelated to text indexing; rawdict otherwise copies them.
+    raw = page.get_text("rawdict", flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES)
     chars: list[str] = []
-    boxes: list[tuple] = []
+    boxes = idx.boxes
     source: list[str] = []
     source_pos = 0
     for blk in raw.get("blocks", []):
@@ -83,9 +112,10 @@ def build_page_index(page: fitz.Pixmap_or_Page, page_no: int) -> PageIndex:
                     bb = c.get("bbox")
                     if not bb:
                         continue
-                    chars.append(ch)
-                    boxes.append(tuple(bb))
-                    idx.source_offsets.append(offset)
+                    for j, character in enumerate(ch):
+                        chars.append(character)
+                        boxes.append(bb)
+                        idx.source_offsets.append(offset + j)
             if len(chars) > line_start:
                 line_boxes = boxes[line_start:]
                 bounds = (min(b[0] for b in line_boxes), min(b[1] for b in line_boxes),
@@ -209,23 +239,42 @@ def merge_boxes(boxes: list, page_height: float = 0.0,
 class TextIndex:
     """全书字符索引。逐页缓存,支持增量构建与取消。"""
 
-    def __init__(self) -> None:
-        self.pages: dict[int, PageIndex] = {}
+    def __init__(self, max_pages=None, loader=None) -> None:
+        # Standalone indexes may retain all geometry. The document worker gives
+        # a loader and a bounded LRU; normalized full-book text stays searchable.
+        if max_pages is not None and (max_pages < 1 or loader is None):
+            raise ValueError("A bounded index needs a positive limit and loader")
+        self.pages: dict[int, PageIndex] = OrderedDict()
+        self.texts: dict[int, str] = {}
+        self.max_pages, self._loader = max_pages, loader
         self.total_chars = 0
 
     def add_page(self, page_no: int, idx: PageIndex) -> None:
         self.pages[page_no] = idx
-        self.total_chars = sum(len(p) for p in self.pages.values())
+        self.pages.move_to_end(page_no)
+        self.total_chars += len(idx) - len(self.texts.get(page_no, ""))
+        self.texts[page_no] = idx.norm_text
+        if self.max_pages is not None:
+            while len(self.pages) > self.max_pages:
+                self.pages.popitem(last=False)
+
+    def get_page(self, page_no):
+        if page_no not in self.pages:
+            if page_no not in self.texts or self._loader is None:
+                return None
+            self.add_page(page_no, self._loader(page_no))
+        self.pages.move_to_end(page_no)
+        return self.pages[page_no]
 
     def __len__(self) -> int:
-        return len(self.pages)
+        return len(self.texts)
 
     def has(self, page_no: int) -> bool:
-        return page_no in self.pages
+        return page_no in self.texts
 
     # ---------------- 匹配 ----------------
 
-    def find(self, needle: str) -> list[dict]:
+    def find(self, needle: str, cancelled=None) -> list[dict]:
         """在已建索引的页里找 needle(字面量,不做正则转义)。
 
         返回 [{page, start, end, rects}] —— start/end 是**归一化文本**的下标区间,
@@ -235,12 +284,14 @@ class TextIndex:
             return []
         out: list[dict] = []
         n = len(needle)
-        for pno in sorted(self.pages):
-            idx = self.pages[pno]
-            text = idx.norm_text
+        for pno in sorted(self.texts):
+            if cancelled is not None and cancelled():
+                return []
+            text = self.texts[pno]
             if not text:
                 continue
             pos = text.find(needle)
+            idx = self.get_page(pno) if pos != -1 else None
             while pos != -1:
                 boxes = idx.boxes[pos:pos + n]
                 out.append({
@@ -254,7 +305,7 @@ class TextIndex:
 
     def char_range_rects(self, page_no: int, start: int, end: int) -> list:
         """取某页归一化下标区间的合并矩形(M5 选字用)。"""
-        idx = self.pages.get(page_no)
+        idx = self.get_page(page_no)
         if idx is None:
             return []
         boxes = idx.boxes[start:end]
@@ -262,7 +313,7 @@ class TextIndex:
 
     def char_ranges_rects(self, page_no: int, ranges: list) -> list:
         """区域预览与 PDF 批注共用同一组独立字符区间。"""
-        idx = self.pages[page_no]
+        idx = self.get_page(page_no)
         rects = []
         for a, b in ranges:
             if not 0 <= a < b <= len(idx):
@@ -271,8 +322,7 @@ class TextIndex:
         return rects
 
     def page_text(self, page_no: int) -> str:
-        idx = self.pages.get(page_no)
-        return idx.norm_text if idx else ""
+        return self.texts.get(page_no, "")
 
 
 def baseline_search_for(doc, needle: str) -> int:

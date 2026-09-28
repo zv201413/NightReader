@@ -26,6 +26,7 @@ M1 只用到前三个,其余在 M2–M5 填入实现;此处先把分发骨架立
 from __future__ import annotations
 
 import math
+import os
 import queue
 import re
 import statistics
@@ -103,6 +104,9 @@ GET_ANNOTS = "GetAnnots"
 SELECT_TEXT = "SelectText"
 SAVE = "Save"
 SHRINK = "Shrink"
+MEMORY_STATS = "MemoryStats"
+STORE_LIMIT_BYTES = 64 * 1024 * 1024
+STORE_TASKS = frozenset((RENDER, RENDER_TEXT, SEARCH, BUILD_INDEX, SELECT_TEXT))
 
 
 class _TextOnlyDevice(fitz.mupdf.FzDevice2):
@@ -337,6 +341,11 @@ class DocWorker:
         self._index = None
         self._text_page_decisions = {}
         self._search_token = 0
+        self._store_limit = (0 if os.environ.get("NIGHTREAD_STORE_SHRINK", "").lower()
+                             in ("0", "false", "no", "off") else STORE_LIMIT_BYTES)
+        self._store_shrinks = 0
+        self._store_error = None
+        self._store_keep_percent = 50
 
     def cancel_search(self) -> None:
         """M4-6:请求中止在途的索引构建/搜索。UI 线程调用,不阻塞。"""
@@ -413,16 +422,68 @@ class DocWorker:
                              doc_generation=self.generation, request_id=rid,
                              meta=task.meta,
                              elapsed_ms=(time.perf_counter() - t0) * 1000)
+            if task.kind in STORE_TASKS:
+                self._maintain_store()
+                res.elapsed_ms = (time.perf_counter() - t0) * 1000
             if task.callback:
                 # 闭包捕获 res,避免循环变量问题
                 self._post_to_ui(lambda r=res, cb=task.callback: cb(r))
+            # A blocked queue.get() must not retain the last page/result.
+            res = value = task = None
         # 收尾:关文档
         try:
-            if self._doc is not None:
-                self._doc.close()
-                self._doc = None
+            self._op_close()
         except Exception:
             pass
+
+    def _maintain_store(self, clear=False) -> None:
+        """Optional MuPDF cache maintenance, exclusively on this worker.
+
+        The limit is a post-task target, not a hard peak-memory limit. Referenced
+        store entries cannot be evicted; bound retries if MuPDF makes no progress.
+        """
+        if not self._store_limit:
+            return
+        try:
+            from .memstats import store_size
+            if clear:
+                fitz.TOOLS.store_shrink(100)
+                self._store_shrinks += 1
+            else:
+                size, _source = store_size()
+                keep = self._store_keep_percent
+                while size > self._store_limit:
+                    fitz.TOOLS.store_shrink(100 - keep)
+                    self._store_shrinks += 1
+                    remaining, _source = store_size()
+                    if remaining >= size:
+                        # Some MuPDF builds apply the percentage to the store
+                        # maximum, despite TOOLS documenting the current size.
+                        # Progressively lower that target without ever emptying
+                        # the store during reading. Pinned entries may remain.
+                        if keep == 1:
+                            self._store_keep_percent = 50
+                            break
+                        keep = max(1, keep // 2)
+                        self._store_keep_percent = keep
+                    size = remaining
+            self._store_error = None
+        except Exception as exc:
+            # An unavailable optional API must never interrupt reading/saving.
+            self._store_error = type(exc).__name__
+
+    def _op_memory_stats(self) -> dict:
+        from .memstats import index_stats, store_size
+        source = None
+        try:
+            store_bytes, source = store_size()
+        except Exception:
+            store_bytes = None
+        return {"store_bytes": store_bytes, "store_size_source": source,
+                "store_limit_bytes": self._store_limit,
+                "store_shrinks": self._store_shrinks, "store_error": self._store_error,
+                "generation": self.generation, "queue_tasks": self._q.qsize(),
+                "index": index_stats(self._index)}
 
     # ---------------- 任务分发 ----------------
 
@@ -460,6 +521,8 @@ class DocWorker:
             return self._op_save(**kw)
         if k == SHRINK:
             return self._op_shrink(**kw)
+        if k == MEMORY_STATS:
+            return self._op_memory_stats()
         raise ValueError(f"未知任务类型: {k}")
 
     # ---------------- 各操作实现 ----------------
@@ -469,11 +532,17 @@ class DocWorker:
             raise RuntimeError("尚未打开文档")
         return self._doc
 
+    def _load_page_index(self, page_no):
+        from .textindex import build_page_index
+        return build_page_index(self._require_doc()[page_no - 1], page_no)
+
+    def _new_text_index(self):
+        from .textindex import TextIndex
+        return TextIndex(max_pages=8, loader=self._load_page_index)
+
     def _op_open(self, path: str) -> dict:
         if self._doc is not None:
-            self._doc.close()
-            self._doc = None
-            self._bump_generation()
+            self._op_close()
         d = fitz.open(path)
         self._doc = d
         self._path = path
@@ -495,6 +564,7 @@ class DocWorker:
             self._index = None
             self._search_token += 1
             self._bump_generation()
+        self._maintain_store(clear=True)
         return {"closed": True}
 
     def _op_render(self, page_no: int, zoom: float, highlight_masks: bool = False):
@@ -590,7 +660,7 @@ class DocWorker:
         换关键词/换文件/Esc 时立即中止。
         """
         import time as _t
-        from .textindex import TextIndex, build_page_index, baseline_search_for
+        from .textindex import build_page_index, baseline_search_for
 
         d = self._require_doc()
         t0 = _t.perf_counter()
@@ -599,7 +669,7 @@ class DocWorker:
         # 已建的索引用缓存的,缺的页按需补建(当前页优先由调用方决定顺序)
         ti = self._index
         if ti is None:
-            ti = TextIndex()
+            ti = self._new_text_index()
             self._index = ti
         # Selection and cancelled searches can leave a partial index. Complete
         # its missing pages before treating it as a whole-document search.
@@ -610,7 +680,10 @@ class DocWorker:
             if not ti.has(pno):
                 ti.add_page(pno, build_page_index(d[pno - 1], pno))
 
-        hits = ti.find(needle)
+        hits = ti.find(needle, cancelled=lambda: my_token != self._search_token)
+        if my_token != self._search_token:
+            return {"hits": [], "baseline": 0, "cancelled": True,
+                    "elapsed_ms": (_t.perf_counter() - t0) * 1000.0}
         elapsed = (_t.perf_counter() - t0) * 1000.0
         return {
             "hits": hits,
@@ -625,10 +698,10 @@ class DocWorker:
     def _op_build_index(self, **kw) -> dict:
         """M4:后台建全书字符索引。返回字符总数与耗时。"""
         import time as _t
-        from .textindex import TextIndex, build_page_index
+        from .textindex import build_page_index
         d = self._require_doc()
         t0 = _t.perf_counter()
-        ti = TextIndex()
+        ti = self._new_text_index()
         for pno in range(1, len(d) + 1):
             ti.add_page(pno, build_page_index(d[pno - 1], pno))
         self._index = ti
@@ -638,7 +711,7 @@ class DocWorker:
     def _op_add_annot(self, page: int, start: int, end: int,
                       color=(1.0, 1.0, 0.0), opacity: float = 1.0, ranges=None, **kw) -> dict:
         """M5:按归一化字符下标区间加高亮。**全程持有 page 引用**(K7)。"""
-        from .textindex import TextIndex, build_page_index
+        from .textindex import build_page_index
         d = self._require_doc()
         if not (1 <= page <= len(d)):
             raise IndexError(f"页码越界: {page}")
@@ -648,7 +721,7 @@ class DocWorker:
         ti = self._index
         if ti is None or not ti.has(page):
             if ti is None:
-                ti = TextIndex()
+                ti = self._new_text_index()
                 self._index = ti
             ti.add_page(page, build_page_index(pg, page))
         rects = (ti.char_range_rects(page, start, end) if ranges is None
@@ -701,7 +774,7 @@ class DocWorker:
     def _op_select_text(self, page: int, x0: float, y0: float,
                         x1: float, y1: float, mode: str = "text", **kw) -> dict:
         """M5:以鼠标两端定位字符,预览和批注共用同一连续文字区间。"""
-        from .textindex import TextIndex, build_page_index, selection_range, rectangle_selection
+        from .textindex import build_page_index, selection_range, rectangle_selection
         d = self._require_doc()
         if not (1 <= page <= len(d)):
             raise IndexError(f"页码越界: {page}")
@@ -709,10 +782,10 @@ class DocWorker:
         ti = self._index
         if ti is None or not ti.has(page):
             if ti is None:
-                ti = TextIndex()
+                ti = self._new_text_index()
                 self._index = ti
             ti.add_page(page, build_page_index(pg, page))
-        idx = ti.pages[page]
+        idx = ti.get_page(page)
         if mode == "rectangle":
             ranges, copy_text = rectangle_selection(idx, (x0, y0), (x1, y1))
         elif mode == "text":
@@ -742,6 +815,7 @@ class DocWorker:
         d.saveIncr()
         after = _os.path.getsize(path)
         d.close()
+        self._maintain_store(clear=True)
         # K1 第二步:立即重开(绝不能在同一 Document 上再存一次)
         self._doc = fitz.open(path)
         self._index = None          # 重开后页面对象全换,索引必须重建
@@ -772,6 +846,7 @@ class DocWorker:
         path = self._path
         d.saveIncr()
         d.close()
+        self._maintain_store(clear=True)
         self._doc = fitz.open(path)
         # 文档对象全换了,代数自增 → 在途结果作废
         self._bump_generation()

@@ -168,8 +168,11 @@ class TestContinuousInput(unittest.TestCase):
         day = np.frombuffer(base.samples, dtype=np.uint8).reshape(base.height, base.width, 3)
         for mode in ("invert", "soft", "off"):
             self.w.set_night_mode(mode)
-            pixbuf = self.cv._rendered[68]
-            shown = np.frombuffer(pixbuf.get_pixels(), dtype=np.uint8).reshape(base.height, base.width, 3)
+            self.wait(lambda: 68 in self.cv._rendered)
+            surface = self.cv._rendered[68]
+            import sys
+            raw = np.frombuffer(surface.get_data(), dtype=np.uint8).reshape(base.height, base.width, 4)
+            shown = raw[:, :, 2::-1] if sys.byteorder == 'little' else raw[:, :, 1:]
             np.testing.assert_array_equal(shown[y:y+h, x:x+w][coverage], day[y:y+h, x:x+w][coverage])
         self.xdo("key", "ctrl+s")
         self.wait(lambda: not self.w._dirty)

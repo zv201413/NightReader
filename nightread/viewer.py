@@ -77,6 +77,35 @@ def pixmap_bytes(pix: fitz.Pixmap) -> int:
     return pix.height * pix.stride
 
 
+def to_cairo_surface(pix: fitz.Pixmap):
+    """Own one display buffer; RGB24 is native-endian xRGB, four bytes/pixel.
+
+    No borrowed Pixmap pointer escapes. The RGB fast path avoids the temporary
+    Pixbuf and its bytes copy; alpha uses the existing GDK conversion semantics.
+    """
+    import cairo
+    import sys
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32 if pix.alpha else cairo.FORMAT_RGB24,
+                                 pix.width, pix.height)
+    if pix.n == 3 and not pix.alpha:
+        src = np.frombuffer(pix.samples_mv, np.uint8).reshape(pix.height, pix.stride)
+        src = src[:, :pix.width * 3].reshape(pix.height, pix.width, 3)
+        dst = np.frombuffer(surface.get_data(), np.uint8).reshape(
+            pix.height, surface.get_stride() // 4, 4)[:, :pix.width]
+        if sys.byteorder == "little":
+            dst[:, :, :3] = src[:, :, ::-1]
+            dst[:, :, 3] = 255
+        else:
+            dst[:, :, 0] = 255
+            dst[:, :, 1:] = src
+        surface.mark_dirty()
+    else:
+        cr = cairo.Context(surface)
+        Gdk.cairo_set_source_pixbuf(cr, to_gdkpixbuf(pix), 0, 0)
+        cr.paint()
+    return surface
+
+
 # ==========================================================================
 # 二、阅读区视图
 # ==========================================================================

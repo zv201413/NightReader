@@ -11,11 +11,11 @@ primarily Chinese.
 **首版安装包支持 Ubuntu 24.04 LTS、x86_64 / amd64。** 不提供 Windows、macOS 或 ARM 安装包；其他 Linux 发行版暂未验证，可以尝试下面的源码安装方式。
 
 1. 打开 [Releases 下载页](https://github.com/zv201413/NightReader/releases/latest)。
-2. 下载 `NightReader_0.2.0_ubuntu24.04_amd64.deb`。
+2. 下载 `NightReader_0.3.0_ubuntu24.04_amd64.deb`。
 3. 在下载目录打开终端执行：
 
 ```bash
-sudo apt install ./NightReader_0.2.0_ubuntu24.04_amd64.deb
+sudo apt install ./NightReader_0.3.0_ubuntu24.04_amd64.deb
 ```
 
 之后从应用菜单打开 **夜读 NightReader**，或右键 PDF → 打开方式 → NightReader。
@@ -49,6 +49,22 @@ sudo apt remove nightreader
 - 连续选字和矩形选区、复制、高亮批注及颜色设置。
 - 记住窗口尺寸、阅读位置和自定义快捷键。
 - 舒适阅读与已有文字层校对视图。
+
+### 内存与性能
+
+阅读时的内存占用是有界的，不随翻页距离增长：
+
+- MuPDF 的页面缓存目标为 64 MiB，空闲时把已释放的内存归还给系统。
+- 字符坐标只为最近 8 页保留，全文搜索仍覆盖整本。
+- 页面渲染只保留可见页的显示表面，并沿滚动方向预读下一页（额外最多一页 / 16 MiB）。
+- 快速翻页和缩放会在请求进入 MuPDF 之前丢弃过期的渲染，始终优先做当前页。
+- 文档操作在独立的子进程里串行执行，PyMuPDF 占用 Python GIL 时不会卡住界面。
+
+状态栏的「常驻 X 页 / XX MB」显示的是页图缓存，不是程序的全部内存；高倍缩放会显著增大页图。
+
+设置 `NIGHTREAD_MEMSTATS=1` 可开启内存诊断：每 5 秒或收到 `SIGUSR1` 时输出 JSON，
+其中 `process` 是界面进程、`worker.process` 是文档子进程，`reader_total` 汇总两者的
+RSS+Swap 与 PSS+SwapPss（多开比较优先看后者）。
 
 **不包含 OCR。** 没有文字层的扫描 PDF 可以阅读，但不能直接搜索或复制文字。
 文字层视图不会修正 PDF 中已有的识别错误。书签与批注需要手动保存；关闭有未保存修改的窗口时会提示。
@@ -98,7 +114,7 @@ python3 packaging/build-deb.py
 构建脚本按 `packaging/dependencies.json` 下载固定版本的 wheel 和对应源码，校验 SHA-256，然后生成 `.deb`、依赖源码归档和校验文件。应用运行时不调用 pip。
 
 GitHub Actions 对代码执行测试、构建，并在干净 Ubuntu 容器中验证安装、GUI 搜索、保存和卸载。
-推送 `v0.2.0` 这类版本标签后，只有所有检查通过才会发布 GitHub Release。
+推送 `v0.3.0` 这类版本标签后，只有所有检查通过才会发布 GitHub Release。
 
 ## 许可与反馈
 

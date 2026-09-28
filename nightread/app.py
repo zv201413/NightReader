@@ -21,6 +21,7 @@ except Exception:
     _HAVE_GTK = False
 
 from .window import MainWindow
+from .continuous import tune_allocator
 
 APP_ID = "org.nightread.Nightread"
 
@@ -70,6 +71,9 @@ class NightreadApp(Gtk.Application if _HAVE_GTK else object):
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Memory plan P1: tune glibc malloc before any window or worker thread
+    # exists. A silent no-op off glibc or with NIGHTREAD_ALLOC_TUNING=0.
+    tune_allocator()
     argv = list(sys.argv if argv is None else argv)
     if not _HAVE_GTK:
         print("错误: 需要 GTK3 + PyGObject。", file=sys.stderr)
